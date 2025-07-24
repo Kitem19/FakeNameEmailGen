@@ -3,9 +3,10 @@
 # ==============================================================================
 #                 GENERATORE DI PROFILI FAKE CON EMAIL TEMPORANEA
 # ==============================================================================
-# Versione 5: Corregge il `TypeError` eliminando la chiamata all'endpoint
-# `/domains` dell'API di mail.tm, che risultava instabile.
-# Ora viene utilizzato un dominio noto e hardcodato.
+# Versione 6 (Definitiva): Risolve l'errore `422 Unprocessable Entity`.
+# Il problema era l'uso di un dominio hardcodato (`mail.tm`).
+# Questa versione chiede dinamicamente all'API quale dominio usare, rendendo
+# il codice robusto e funzionante.
 #
 # Per eseguirlo:
 # 1. Assicurati di avere le librerie: pip install streamlit pandas faker requests
@@ -41,10 +42,15 @@ REQUESTS_HEADERS = {'Accept': 'application/json', 'Content-Type': 'application/j
 def create_temp_email_mailtm():
     """Crea un account email su mail.tm e ottiene un token di autenticazione."""
     try:
-        # --- PASSO 1: Usa un dominio noto e funzionante (FIX) ---
-        # Abbiamo rimosso la chiamata a /domains che causava l'errore.
-        # Usiamo direttamente un dominio offerto dal servizio.
-        domain = "mail.tm"
+        # --- PASSO 1: Ottieni un dominio disponibile dinamicamente (FIX DEFINITIVO) ---
+        domains_response = requests.get(f"{API_MAILTM}/domains", headers=REQUESTS_HEADERS)
+        domains_response.raise_for_status()
+        domains_list = domains_response.json().get('hydra:member')
+        if not domains_list:
+            st.error("L'API di mail.tm non ha fornito domini disponibili.")
+            return None
+        # Prendiamo il primo dominio attivo dalla lista
+        domain = domains_list[0]['domain']
         
         # Genera un nome utente e una password casuali
         username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
@@ -76,8 +82,7 @@ def create_temp_email_mailtm():
 
 def show_inbox_mailtm(address, token):
     """Usa il token per leggere la casella di posta di un indirizzo mail.tm."""
-    if not address or not token:
-        return
+    if not address or not token: return
 
     st.markdown("---")
     st.subheader(f"📬 Casella di posta per: `{address}`")
@@ -92,15 +97,13 @@ def show_inbox_mailtm(address, token):
 
                 if not messages:
                     st.info("La casella di posta è vuota.")
-                    return
-
-                st.success(f"Trovati {len(messages)} messaggi!")
-                
-                for msg_summary in messages:
-                    with st.expander(f"**Da:** {msg_summary.get('from', {}).get('address', 'N/A')} | **Oggetto:** {msg_summary.get('subject', 'Nessun oggetto')}"):
-                        date_str = pd.to_datetime(msg_summary.get('createdAt')).strftime('%d/%m/%Y %H:%M') if 'createdAt' in msg_summary else 'N/A'
-                        st.caption(f"Data: {date_str}")
-                        st.text_area("Anteprima del corpo", msg_summary.get('intro', 'Nessuna anteprima.'), height=150, disabled=True)
+                else:
+                    st.success(f"Trovati {len(messages)} messaggi!")
+                    for msg_summary in reversed(messages): # Mostra i più recenti prima
+                        with st.expander(f"**Da:** {msg_summary.get('from', {}).get('address', 'N/A')} | **Oggetto:** {msg_summary.get('subject', 'Nessun oggetto')}"):
+                            date_str = pd.to_datetime(msg_summary.get('createdAt')).strftime('%d/%m/%Y %H:%M') if 'createdAt' in msg_summary else 'N/A'
+                            st.caption(f"Data: {date_str}")
+                            st.text_area("Anteprima del corpo", msg_summary.get('intro', 'Nessuna anteprima.'), height=150, disabled=True, key=f"msg_{msg_summary['id']}")
 
             except requests.exceptions.RequestException as e:
                 st.error(f"Errore durante la lettura della posta da mail.tm: {e}")
@@ -147,11 +150,8 @@ def generate_single_profile(country_name, additional_fields):
 st.title("👤 Generatore di Profili Fake")
 st.markdown("Crea dati fittizi per test, completi di email temporanea funzionante tramite **mail.tm**.")
 
-# Resetta i dati alla ricarica della pagina per evitare stati vecchi
-if 'final_df' not in st.session_state:
-    st.session_state.final_df = None
-if 'email_data' not in st.session_state:
-    st.session_state.email_data = None
+if 'final_df' not in st.session_state: st.session_state.final_df = None
+if 'email_data' not in st.session_state: st.session_state.email_data = None
 
 with st.sidebar:
     st.header("⚙️ Opzioni di Generazione")
@@ -160,17 +160,9 @@ with st.sidebar:
     additional_fields = st.multiselect('Campi aggiuntivi', ['Email', 'Telefono', 'Codice Fiscale', 'Partita IVA'], default=['Email'])
     
     if st.button("🚀 Genera Profili", type="primary"):
-        all_profiles = []
-        progress_bar = st.progress(0, text="Generazione profili in corso...")
-        
-        for i in range(num_profiles):
-            profile_df = generate_single_profile(country_name, additional_fields)
-            if not profile_df.empty:
-                all_profiles.append(profile_df)
-            progress_bar.progress((i + 1) / num_profiles, text=f"Generato profilo {i + 1}/{num_profiles}")
-
-        st.session_state.final_df = pd.concat(all_profiles, ignore_index=True) if all_profiles else None
-        # Non è necessario un rerun, lo stato viene aggiornato e Streamlit riesegue il codice sottostante
+        with st.spinner("Generazione profili in corso..."):
+            all_profiles = [generate_single_profile(country_name, additional_fields) for _ in range(num_profiles)]
+        st.session_state.final_df = pd.concat([df for df in all_profiles if not df.empty], ignore_index=True) if any(all_profiles) else None
 
 # --- Visualizzazione dei risultati ---
 if st.session_state.final_df is not None:
@@ -180,7 +172,7 @@ if st.session_state.final_df is not None:
     csv = st.session_state.final_df.to_csv(index=False).encode('utf-8')
     st.download_button("📥 Scarica come CSV", csv, f'profili_{country_name.lower()}.csv', 'text/csv')
     
-    if st.session_state.email_data:
+    if st.session_state.email_data and "Creazione email fallita" not in st.session_state.final_df['Email'].iloc[0]:
         show_inbox_mailtm(st.session_state.email_data['address'], st.session_state.email_data['token'])
 else:
      st.info("Configura le opzioni nella barra laterale e clicca su 'Genera Profili'.")
