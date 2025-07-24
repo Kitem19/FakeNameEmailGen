@@ -3,8 +3,8 @@
 # ==============================================================================
 #                 GENERATORE DI PROFILI FAKE CON EMAIL TEMPORANEA
 # ==============================================================================
-# Versione Corretta: include l'header User-Agent per prevenire l'errore 403 Forbidden
-# quando l'app è ospitata su servizi cloud come Streamlit Cloud.
+# Versione 3: Utilizza l'API di mail.tm, che è più robusta e meno soggetta
+# a blocchi 403 rispetto a 1secmail, grazie all'uso di token di autenticazione.
 #
 # Per eseguirlo:
 # 1. Assicurati di avere le librerie necessarie:
@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import random
+import string
 import requests
 import pandas as pd
 import streamlit as st
@@ -43,47 +44,57 @@ PREDEFINED_IBANS = {
     ]
 }
 
-# --- FUNZIONI DI SUPPORTO PER L'API DI EMAIL TEMPORANEA (1secmail.com) ---
-API_1SECMAIL = "https://www.1secmail.com/api/v1/"
-# Definiamo un header che simula un browser comune per evitare blocchi 403.
+# --- FUNZIONI DI SUPPORTO PER L'API DI EMAIL TEMPORANEA (mail.tm) ---
+API_MAILTM = "https://api.mail.tm"
 REQUESTS_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    'Accept': 'application/json',
+    'Content-Type': 'application/json'
 }
 
-def get_temp_email_from_api():
-    """Chiama l'API di 1secmail per generare un indirizzo email casuale."""
+def create_temp_email_mailtm():
+    """Crea un account email temporaneo su mail.tm e restituisce indirizzo e token."""
     try:
-        response = requests.get(
-            f"{API_1SECMAIL}?action=genRandomMailbox&count=1", 
-            headers=REQUESTS_HEADERS
-        )
-        response.raise_for_status()
-        email_address = response.json()[0]
-        return email_address
-    except requests.exceptions.RequestException as e:
-        if e.response and e.response.status_code == 403:
-            st.error("Errore 403: L'accesso all'API di 1secmail è stato bloccato. Questo accade spesso quando l'app è ospitata su cloud.")
-        else:
-            st.error(f"Errore di rete nel contattare 1secmail: {e}")
-        return "errore@api.com"
+        # 1. Ottieni un dominio disponibile dall'API
+        domains_response = requests.get(f"{API_MAILTM}/domains", headers=REQUESTS_HEADERS)
+        domains_response.raise_for_status()
+        domain = domains_response.json()[0]['domain']
 
-def show_inbox_from_api(email_address):
-    """Mostra un pulsante per controllare la posta e visualizzarla."""
-    if not email_address or "@" not in email_address or "errore@" in email_address:
+        # 2. Genera un nome utente e una password casuali
+        username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
+        password = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+        address = f"{username}@{domain}"
+
+        # 3. Crea l'account inviando una richiesta POST
+        account_data = {'address': address, 'password': password}
+        token_response = requests.post(f"{API_MAILTM}/accounts", json=account_data, headers=REQUESTS_HEADERS)
+        token_response.raise_for_status()
+        
+        # 4. Estrai il token di autenticazione per le richieste future
+        token = token_response.json()['token']
+        
+        return {'address': address, 'token': token}
+
+    except requests.exceptions.RequestException as e:
+        st.error(f"Errore durante la creazione dell'email con mail.tm: {e}")
+        return None
+
+def show_inbox_mailtm(address, token):
+    """Usa il token per leggere la casella di posta di un indirizzo mail.tm."""
+    if not address or not token:
         return
 
     st.markdown("---")
-    st.subheader(f"📬 Casella di posta per: `{email_address}`")
+    st.subheader(f"📬 Casella di posta per: `{address}`")
     
     if st.button("🔄 Controlla/Aggiorna messaggi"):
-        with st.spinner("Recupero messaggi da 1secmail.com..."):
+        with st.spinner("Recupero messaggi da mail.tm..."):
             try:
-                login, domain = email_address.split('@')
+                # Usa il token nell'header di autorizzazione come "Bearer" token
+                auth_header = {**REQUESTS_HEADERS, 'Authorization': f'Bearer {token}'}
                 
-                check_url = f"{API_1SECMAIL}?action=getMessages&login={login}&domain={domain}"
-                response_msgs = requests.get(check_url, headers=REQUESTS_HEADERS, timeout=15)
-                response_msgs.raise_for_status()
-                messages = response_msgs.json()
+                messages_response = requests.get(f"{API_MAILTM}/messages", headers=auth_header, timeout=20)
+                messages_response.raise_for_status()
+                messages = messages_response.json()
 
                 if not messages:
                     st.info("La casella di posta è vuota.")
@@ -92,46 +103,30 @@ def show_inbox_from_api(email_address):
                 st.success(f"Trovati {len(messages)} messaggi!")
                 
                 for msg_summary in messages:
-                    msg_id = msg_summary['id']
-                    read_url = f"{API_1SECMAIL}?action=readMessage&login={login}&domain={domain}&id={msg_id}"
-                    response_full_msg = requests.get(read_url, headers=REQUESTS_HEADERS, timeout=15)
-                    response_full_msg.raise_for_status()
-                    full_msg = response_full_msg.json()
-
-                    with st.expander(f"**Da:** {full_msg['from']} | **Oggetto:** {full_msg['subject']}"):
-                        st.caption(f"Data: {full_msg['date']}")
-                        st.caption(f"ID Messaggio: {full_msg['id']}")
-                        
-                        body_content = full_msg.get('htmlBody') or f"<pre>{full_msg.get('body')}</pre>"
-                        st.components.v1.html(body_content, height=400, scrolling=True)
+                    with st.expander(f"**Da:** {msg_summary['from']['address']} | **Oggetto:** {msg_summary['subject']}"):
+                        st.caption(f"Data: {msg_summary['createdAt']}")
+                        # Il corpo del messaggio è nel campo 'intro'
+                        st.text_area("Anteprima del corpo", msg_summary['intro'], height=150, disabled=True)
 
             except requests.exceptions.RequestException as e:
-                st.error(f"Errore durante la comunicazione con 1secmail: {e}")
-
+                st.error(f"Errore durante la lettura della posta da mail.tm: {e}")
 
 # --- FUNZIONI DI LOGICA PER LA GENERAZIONE DEL PROFILO ---
-
 def get_next_iban(country_code):
     """Recupera il prossimo IBAN disponibile da una lista mescolata."""
+    # (Questa funzione rimane invariata)
     country_code_upper = country_code.upper()
-    
     if 'iban_state' not in st.session_state:
         st.session_state.iban_state = {}
-
     if country_code_upper not in st.session_state.iban_state or \
        st.session_state.iban_state[country_code_upper]['index'] >= len(st.session_state.iban_state[country_code_upper]['list']):
-        
         iban_list = PREDEFINED_IBANS.get(country_code_upper, ["N/A - Lista paese vuota"])
         random.shuffle(iban_list)
         st.session_state.iban_state[country_code_upper] = {'list': iban_list, 'index': 0}
-
     state = st.session_state.iban_state[country_code_upper]
     iban_to_return = state['list'][state['index']]
-    
     st.session_state.iban_state[country_code_upper]['index'] += 1
-    
     return iban_to_return
-
 
 def generate_single_profile(country_name, additional_fields):
     """Genera un singolo profilo fake con tutti i dati richiesti."""
@@ -155,8 +150,16 @@ def generate_single_profile(country_name, additional_fields):
     profile['IBAN'] = get_next_iban(iso_code)
     profile['Paese'] = country_name
 
+    # Logica per l'email modificata per usare la nuova API
     if 'Email' in additional_fields:
-        profile['Email'] = get_temp_email_from_api()
+        email_data = create_temp_email_mailtm()
+        if email_data:
+            profile['Email'] = email_data['address']
+            # Salva i dati dell'email (incluso il token) in session_state per un uso successivo
+            st.session_state.email_data = email_data
+        else:
+            profile['Email'] = "Creazione email fallita"
+    
     if 'Telefono' in additional_fields:
         profile['Telefono'] = fake.phone_number()
     if 'Codice Fiscale' in additional_fields:
@@ -172,33 +175,38 @@ def generate_single_profile(country_name, additional_fields):
 # ==============================================================================
 
 st.title("👤 Generatore di Profili Fake")
-st.markdown("Crea dati fittizi per test, completi di email temporanea funzionante.")
+st.markdown("Crea dati fittizi per test, completi di email temporanea funzionante tramite **mail.tm**.")
+
+# Resetta i dati dell'email all'inizio per evitare di mostrare inbox di sessioni precedenti
+if 'email_data' not in st.session_state:
+    st.session_state.email_data = None
 
 with st.sidebar:
     st.header("⚙️ Opzioni di Generazione")
+    country_name = st.selectbox('Seleziona il Paese', ('Italia', 'Francia', 'Germania', 'Lussemburgo'))
+    num_profiles = st.number_input('Numero di profili', min_value=1, max_value=50, value=1, step=1)
+    additional_fields = st.multiselect('Campi aggiuntivi', ['Email', 'Telefono', 'Codice Fiscale', 'Partita IVA'], default=['Email'])
     
-    country_name = st.selectbox(
-        'Seleziona il Paese',
-        ('Italia', 'Francia', 'Germania', 'Lussemburgo')
-    )
-    
-    num_profiles = st.number_input(
-        'Numero di profili da generare',
-        min_value=1,
-        max_value=50,
-        value=1,
-        step=1
-    )
-    
-    additional_fields = st.multiselect(
-        'Campi aggiuntivi da includere',
-        ['Email', 'Telefono', 'Codice Fiscale', 'Partita IVA'],
-        default=['Email']
-    )
-    
-    generate_button = st.button("🚀 Genera Profili", type="primary")
+    if st.button("🚀 Genera Profili", type="primary"):
+        # Quando si genera, si puliscono i dati della vecchia email
+        st.session_state.email_data = None
+        # Triggera un rerun per eseguire la logica di generazione
+        st.experimental_rerun()
 
-if generate_button:
+# Logica di generazione spostata qui per essere triggerata dal rerun
+if st.session_state.get('triggered_generation', False) or st.button("Genera Profili", key="main_gen", help="Clicca dopo aver scelto le opzioni"):
+    # Questo è un placeholder per la logica di generazione che ora è nel sidebar
+    # Questa parte potrebbe essere ulteriormente raffinata se necessario
+    # Per ora, si assume che il pulsante nel sidebar sia il principale
+    pass
+
+# Logica di generazione principale, separata dal pulsante per gestire il rerun
+if 'final_df' not in st.session_state:
+    st.session_state.final_df = None
+
+# La logica di generazione viene eseguita solo se il pulsante è stato premuto
+# Questo è un pattern comune per gestire azioni in Streamlit
+if st.sidebar.button("Esegui Generazione", key="execute_generation"):
     all_profiles = []
     progress_bar = st.progress(0, text="Generazione profili in corso...")
     
@@ -209,22 +217,27 @@ if generate_button:
         progress_bar.progress((i + 1) / num_profiles, text=f"Generato profilo {i + 1}/{num_profiles}")
 
     if all_profiles:
-        final_df = pd.concat(all_profiles, ignore_index=True)
-        
-        st.success(f"✅ Generati con successo {len(final_df)} profili.")
-        st.dataframe(final_df)
-        
-        csv = final_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-           label="📥 Scarica come CSV",
-           data=csv,
-           file_name=f'profili_generati_{country_name.lower()}.csv',
-           mime='text/csv',
-        )
-        
-        if num_profiles == 1 and 'Email' in final_df.columns:
-            email_address = final_df['Email'].iloc[0]
-            show_inbox_from_api(email_address)
+        st.session_state.final_df = pd.concat(all_profiles, ignore_index=True)
+    else:
+        st.session_state.final_df = None
 
+# Mostra i risultati se sono presenti in session_state
+if st.session_state.final_df is not None:
+    final_df = st.session_state.final_df
+    st.success(f"✅ Generati con successo {len(final_df)} profili.")
+    st.dataframe(final_df)
+    
+    csv = final_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+       label="📥 Scarica come CSV",
+       data=csv,
+       file_name=f'profili_generati_{country_name.lower()}.csv',
+       mime='text/csv',
+    )
+    
+    # Mostra l'inbox solo se sono stati generati dati email validi
+    if st.session_state.email_data:
+        email_data = st.session_state.email_data
+        show_inbox_mailtm(email_data['address'], email_data['token'])
 else:
-    st.info("Configura le opzioni nella barra laterale e clicca su 'Genera Profili'.")
+     st.info("Configura le opzioni nella barra laterale e clicca su 'Esegui Generazione'.")
